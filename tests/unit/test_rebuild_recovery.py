@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from memweave import MemWeave
-from memweave.exceptions import StorageError
+from memweave.exceptions import EmbeddingError, StorageError
 from tests.unit.test_store import MockEmbeddingProvider, _make_config, _write_md
 
 
@@ -72,3 +72,48 @@ async def test_changed_configuration_restarts_pending_generation(tmp_path: Path)
         assert (await new.index()).files_indexed == 1
         row = await (await new._db.execute("SELECT length(embedding) FROM chunks_vec")).fetchone()
         assert row[0] == 16
+
+
+async def test_large_file_retains_embedding_batches_without_publishing_partial_text(tmp_path: Path):
+    path = _write_md(tmp_path, "memory/large.md", "Original searchable text")
+    cfg = _make_config(tmp_path)
+    cfg.embedding.batch_size = 1
+    cfg.chunking.tokens = 8
+    cfg.chunking.overlap = 0
+    provider = MockEmbeddingProvider()
+    mem = MemWeave(cfg, embedding_provider=provider)
+    await mem.index()
+    old_hash = (await mem.files())[0].hash
+    path.write_text(
+        "\n\n".join(f"Section {i} contains different information {i}" for i in range(6))
+    )
+    original = provider.embed_batch
+    cached_texts = []
+
+    async def interrupted_batch(texts):
+        if cached_texts:
+            raise EmbeddingError("backend unavailable")
+        cached_texts.extend(texts)
+        return await original(texts)
+
+    with patch.object(provider, "embed_batch", side_effect=interrupted_batch):
+        with patch.object(mem, "_embed_with_halving", return_value=None):
+            with pytest.raises(EmbeddingError, match="not checkpointed"):
+                await mem.index(force=True)
+    # Cached API work is durable, but the file is still the previous complete version.
+    assert (await mem.files())[0].hash == old_hash
+    rows = await (await mem._db.execute("SELECT text FROM chunks_fts")).fetchall()
+    assert "Original searchable text" in " ".join(row[0] for row in rows)
+    await mem.close()
+
+    resumed_provider = MockEmbeddingProvider()
+    async with MemWeave(cfg, embedding_provider=resumed_provider) as resumed:
+        result = await resumed.index(force=True)
+        assert result.files_indexed == 1
+        assert result.embeddings_cached >= 1
+        assert all(
+            text not in cached_texts
+            for batch in resumed_provider.embed_batch_calls
+            for text in batch
+        )
+        assert (await resumed.files())[0].hash != old_hash

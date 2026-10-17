@@ -189,13 +189,16 @@ The SQLite index is a **derived cache** — always rebuildable from the Markdown
 - `git diff memory/` shows exactly what an agent learned between commits.
 - Losing the database is not data loss. Losing the files is.
 
-Indexing commits each file's text, vectors, embedding cache, and file hash together.
+Indexing commits each file's text, vectors, and file hash together.
 An interrupted forced rebuild retains a checkpoint for each completed file. The next
 `index()` (including `index(force=True)`) resumes the pending generation without
 dropping its vectors again; changed files are still reindexed. A model, endpoint,
 or chunking change starts a new generation. After a successful run, `force=True`
 starts a fresh rebuild. Embedding or vector-write failures raise an error and leave
 the failed file eligible for retry instead of marking an incomplete file indexed.
+Completed embedding batches are cached before replacing the file's indexed
+contents, so a large file can also resume API work across timeouts. A partially
+embedded file retains its previous complete text index until it is ready to publish.
 
 Schema version 2 migrates existing FTS metadata to indexed rowid lookups without
 reembedding the vault. All processes writing the same database should use the

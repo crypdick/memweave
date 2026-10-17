@@ -821,10 +821,6 @@ class MemWeave:
                     "embeddings_computed": 0,
                 }
 
-        # Remove old chunks + FTS entries for this file
-        await self._store.delete_chunks_by_path(rel)
-        await self._store.delete_fts_by_path(rel)
-
         # Chunk the file
         content = abs_path.read_text(encoding="utf-8", errors="replace")
         chunks = chunk_markdown(
@@ -835,6 +831,8 @@ class MemWeave:
 
         if not chunks:
             # Empty file — update file record with no chunks
+            await self._store.delete_chunks_by_path(rel)
+            await self._store.delete_fts_by_path(rel)
             await self._store.upsert_file(
                 path=rel,
                 source=source,
@@ -888,42 +886,38 @@ class MemWeave:
                 "index",
                 f"embedding {len(miss_texts)} new chunk(s) via API  [{rel}]",
             )
-            try:
-                new_vecs = await self.embedding_provider.embed_batch(miss_texts)
-                embeddings_computed = len(new_vecs)
-            except Exception as exc:
-                # Batch failed (e.g. one chunk exceeds model context length).
-                # Fall back to per-chunk embedding so only the bad chunks lose
-                # their vectors instead of the entire file's batch.
-                emit(
-                    p,
-                    EMOJI_WARN,
-                    "index",
-                    f"batch embedding failed for {rel}, retrying per-chunk: {exc}",
-                )
-                logger.warning(
-                    "Batch embedding failed for %s: %s. Retrying each chunk individually.", rel, exc
-                )
-                new_vecs = []
-                for i, text in enumerate(miss_texts):
-                    vec = await self._embed_with_halving(text, rel)
-                    if vec:
-                        new_vecs.append(vec)
-                        embeddings_computed += 1
-                    else:
-                        new_vecs.append([])
-
-        # Store new embeddings in cache
-        if self.config.cache.enabled:
-            for idx, vec in zip(miss_indices, new_vecs):
-                if vec:
-                    await store_embedding(
-                        self._store,
-                        text_hashes[idx],
-                        vec,
-                        model=model,
-                        provider_key=provider_key,
+            batch_size = self.config.embedding.batch_size
+            for start in range(0, len(miss_texts), batch_size):
+                batch = miss_texts[start : start + batch_size]
+                try:
+                    batch_vecs = await self.embedding_provider.embed_batch(batch)
+                    embeddings_computed += len(batch_vecs)
+                except Exception as exc:
+                    emit(p, EMOJI_WARN, "index", f"batch embedding failed for {rel}: {exc}")
+                    logger.warning(
+                        "Batch embedding failed for %s: %s. Retrying each chunk individually.",
+                        rel,
+                        exc,
                     )
+                    batch_vecs = []
+                    for text in batch:
+                        vec = await self._embed_with_halving(text, rel)
+                        batch_vecs.append(vec or [])
+                        embeddings_computed += bool(vec)
+                new_vecs.extend(batch_vecs)
+                if self.config.cache.enabled:
+                    for idx, vec in zip(miss_indices[start : start + batch_size], batch_vecs):
+                        if vec:
+                            await store_embedding(
+                                self._store,
+                                text_hashes[idx],
+                                vec,
+                                model=model,
+                                provider_key=provider_key,
+                            )
+                    # No file rows have been changed yet. Persist expensive API
+                    # work even when this file cannot finish within one attempt.
+                    await self._store.commit()
 
         # Merge cached + new embeddings in original order
         miss_vec_map = dict(zip(miss_indices, new_vecs))
@@ -942,6 +936,8 @@ class MemWeave:
             raise EmbeddingError(
                 f"Incomplete embeddings for {rel}; file was not checkpointed and will be retried"
             )
+        await self._store.delete_chunks_by_path(rel)
+        await self._store.delete_fts_by_path(rel)
         chunk_vec: list[float] | None
         for chunk, chunk_id, text_hash, chunk_vec in zip(chunks, chunk_ids, text_hashes, all_vecs):
             await self._store.upsert_chunk(
