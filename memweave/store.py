@@ -83,7 +83,7 @@ from memweave.config import MemoryConfig
 from memweave.embedding.cache import evict_cache_if_needed, get_cached_embeddings, store_embedding
 from memweave.embedding.provider import EmbeddingProvider, LiteLLMEmbeddingProvider
 from memweave.embedding.vectors import normalize_embedding
-from memweave.exceptions import SearchError
+from memweave.exceptions import EmbeddingError, SearchError, StorageError
 from memweave.search import (
     HybridSearch,
     KeywordSearch,
@@ -111,6 +111,7 @@ logger = logging.getLogger(__name__)
 # Meta key for storing the provider/model fingerprint used to build the index.
 # If it changes, the index is rebuilt from scratch (full re-embed).
 _META_KEY = "memory_index_meta_v1"
+_REBUILD_KEY = "memory_index_rebuild_v1"
 
 
 class MemWeave:
@@ -251,6 +252,9 @@ class MemWeave:
         """
         assert self._db is not None
         try:
+            cursor = await self._db.execute("SELECT value FROM meta WHERE key = ?", [_REBUILD_KEY])
+            if await cursor.fetchone():
+                return
             workspace = Path(self.config.workspace_dir)
 
             async with self._db.execute("SELECT path, mtime FROM files") as cursor:
@@ -536,7 +540,7 @@ class MemWeave:
             return KeywordSearch()
 
         raise SearchError(
-            f"Unknown search strategy {name!r}. " "Register it with mem.register_strategy() first."
+            f"Unknown search strategy {name!r}. Register it with mem.register_strategy() first."
         )
 
     async def _apply_postprocessors(
@@ -661,8 +665,12 @@ class MemWeave:
         emit(p, EMOJI_ADD, "add", f"{abs_path.name}{' (force)' if force else ''}")
         logger.info("add: indexing %s (force=%s)", abs_path, force)
         start = time.monotonic()
-        result = await self._index_file(abs_path, workspace, force=force)
-        await self._store.commit()
+        try:
+            result = await self._index_file(abs_path, workspace, force=force)
+            await self._store.commit()
+        except BaseException:
+            await self._store.rollback()
+            raise
         self._dirty = False
 
         duration_ms = (time.monotonic() - start) * 1000
@@ -697,18 +705,25 @@ class MemWeave:
         disk_paths = {relative_path(f, workspace) for f in disk_files}
         emit(p, EMOJI_INDEX_SCAN, "index", f"{len(disk_files)} file(s) found")
 
-        # Detect provider/model changes that require full re-index
-        if force or await self._provider_fingerprint_changed():
+        # A pending generation survives interruption. Do not drop its vectors
+        # or force completed files again when retrying the same configuration.
+        assert self._db is not None
+        pending = await self._store.get_meta(_REBUILD_KEY)
+        target = json.dumps(self._provider_fingerprint(), sort_keys=True)
+        rebuilding = force or bool(pending) or await self._provider_fingerprint_changed()
+        completed: set[str] = set()
+        if rebuilding:
             force = True
-            # Drop and recreate chunks_vec so its declared FLOAT[N] matches
-            # the new model's output dimensions. Without this, inserting
-            # new-dim vectors into an old-dim table fails silently.
-            if self._vector_available and self._db is not None:
-                try:
+            if pending != target:
+                if self._vector_available:
                     await self._db.execute("DROP TABLE IF EXISTS chunks_vec")
-                    await self._db.commit()
-                except Exception as exc:
-                    logger.debug("Could not drop chunks_vec for rebuild: %s", exc)
+                await self._db.execute("DELETE FROM index_rebuild_files")
+                await self._store.set_meta(_REBUILD_KEY, target)
+                await self._store.commit()
+            else:
+                cursor = await self._db.execute("SELECT path FROM index_rebuild_files")
+                completed = {row[0] for row in await cursor.fetchall()}
+                logger.info("Resuming rebuild with %d completed files", len(completed))
 
         files_indexed = 0
         files_skipped = 0
@@ -719,7 +734,20 @@ class MemWeave:
         for i, abs_path in enumerate(disk_files, 1):
             rel = relative_path(abs_path, workspace)
             emit(p, EMOJI_INDEX_FILE, "index", f"{rel}  ({i}/{len(disk_files)})")
-            r = await self._index_file(abs_path, workspace, force=force)
+            try:
+                r = await self._index_file(
+                    abs_path, workspace, force=force and rel not in completed
+                )
+                if rebuilding:
+                    await self._db.execute(
+                        "INSERT OR IGNORE INTO index_rebuild_files VALUES (?)", [rel]
+                    )
+                # Text, vectors, file hash, embedding cache and checkpoint are
+                # committed together. A failed file cannot poison hash skipping.
+                await self._store.commit()
+            except BaseException:
+                await self._store.rollback()
+                raise
             files_indexed += r["indexed"]
             files_skipped += r["skipped"]
             total_chunks += r["chunks_created"]
@@ -736,6 +764,8 @@ class MemWeave:
 
         # Update provider fingerprint meta
         await self._save_provider_fingerprint()
+        await self._db.execute("DELETE FROM meta WHERE key = ?", [_REBUILD_KEY])
+        await self._db.execute("DELETE FROM index_rebuild_files")
 
         await self._store.commit()
         self._dirty = False
@@ -908,6 +938,10 @@ class MemWeave:
                 all_vecs.append(None)
 
         # Upsert chunks + FTS
+        if self._vector_available and any(not vector for vector in all_vecs):
+            raise EmbeddingError(
+                f"Incomplete embeddings for {rel}; file was not checkpointed and will be retried"
+            )
         chunk_vec: list[float] | None
         for chunk, chunk_id, text_hash, chunk_vec in zip(chunks, chunk_ids, text_hashes, all_vecs):
             await self._store.upsert_chunk(
@@ -1008,7 +1042,7 @@ class MemWeave:
                 [chunk_id, vec_bytes],
             )
         except Exception as exc:
-            logger.warning("Failed to upsert vec for %s: %s", chunk_id, exc)
+            raise StorageError(f"Failed to upsert vec for {chunk_id}: {exc}") from exc
 
     # ── Provider fingerprint ──────────────────────────────────────────────────
 
@@ -1040,24 +1074,29 @@ class MemWeave:
             or meta.get("provider_key") != current_key
             or meta.get("chunk_tokens") != cfg.chunking.tokens
             or meta.get("chunk_overlap") != cfg.chunking.overlap
+            or meta.get("vector_enabled", True) != cfg.vector.enabled
         )
 
-    async def _save_provider_fingerprint(self) -> None:
-        """Persist the current provider/model fingerprint to the meta table."""
-        assert self._store is not None
+    def _provider_fingerprint(self) -> dict[str, Any]:
+        """Identify the embedding and chunking settings for a rebuild."""
         cfg = self.config
         provider_key = make_provider_key(
             "litellm",
             cfg.embedding.model,
             cfg.embedding.api_base,
         )
-        meta = {
+        return {
             "model": cfg.embedding.model,
             "provider_key": provider_key,
             "chunk_tokens": cfg.chunking.tokens,
             "chunk_overlap": cfg.chunking.overlap,
+            "vector_enabled": self.config.vector.enabled,
         }
-        await self._store.set_meta(_META_KEY, json.dumps(meta))
+
+    async def _save_provider_fingerprint(self) -> None:
+        """Persist the current provider/model fingerprint to the meta table."""
+        assert self._store is not None
+        await self._store.set_meta(_META_KEY, json.dumps(self._provider_fingerprint()))
 
     # ── Status & Files ────────────────────────────────────────────────────────
 

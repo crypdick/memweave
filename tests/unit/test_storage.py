@@ -4,7 +4,6 @@ tests/unit/test_storage.py — Unit tests for storage/schema.py, files.py, sqlit
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import aiosqlite
@@ -12,7 +11,6 @@ import pytest
 import pytest_asyncio
 
 from memweave.storage.files import (
-    build_file_entry,
     get_source_from_path,
     is_evergreen,
     is_memory_path,
@@ -44,6 +42,24 @@ async def store(db):
 
 
 class TestSchema:
+    async def test_migrates_existing_fts_rows_without_reembedding(self):
+        async with aiosqlite.connect(":memory:") as conn:
+            await ensure_schema(conn)
+            await conn.execute("DROP TABLE memweave_fts_lookup")
+            await conn.execute("DROP TABLE index_rebuild_files")
+            await conn.execute("UPDATE meta SET value = '1' WHERE key = 'schema_version'")
+            await conn.execute(
+                "INSERT INTO chunks_fts(text,id,path) VALUES ('original','a','old.md')"
+            )
+            await conn.commit()
+            await ensure_schema(conn)
+            store = SQLiteStore(conn)
+            await store.upsert_fts("replacement", "a", "old.md", "memory", 1, 1)
+            rows = await (await conn.execute("SELECT text FROM chunks_fts")).fetchall()
+            assert rows == [("replacement",)]
+            await store.delete_fts_by_path("old.md")
+            assert await (await conn.execute("SELECT * FROM chunks_fts")).fetchall() == []
+
     @pytest.mark.asyncio
     async def test_schema_creates_meta_table(self, db):
         cursor = await db.execute(
@@ -89,7 +105,7 @@ class TestSchema:
     @pytest.mark.asyncio
     async def test_schema_version(self, db):
         version = await get_schema_version(db)
-        assert version == 1
+        assert version == 2
 
 
 # ── SQLiteStore meta tests ────────────────────────────────────────────────────
@@ -267,6 +283,40 @@ class TestSQLiteStoreChunks:
 
 
 class TestSQLiteStoreFTS:
+    async def test_lookup_survives_reopen_rollback_and_other_writers(self, tmp_path):
+        database = tmp_path / "index.sqlite"
+        async with aiosqlite.connect(database) as first, aiosqlite.connect(database) as second:
+            await ensure_schema(first)
+            await ensure_schema(second)
+            a, b = SQLiteStore(first), SQLiteStore(second)
+            await a.upsert_fts("original", "same", "a.md", "memory", 1, 1)
+            await a.commit()
+            await b.upsert_fts("other writer", "same", "b.md", "memory", 1, 1)
+            await b.commit()
+            await a.upsert_fts("rolled back", "same", "c.md", "memory", 1, 1)
+            await a.rollback()
+            rows = await (await first.execute("SELECT text,path FROM chunks_fts")).fetchall()
+            assert rows == [("other writer", "b.md")]
+        async with aiosqlite.connect(database) as reopened:
+            await ensure_schema(reopened)
+            store = SQLiteStore(reopened)
+            await store.delete_fts_by_path("b.md")
+            await store.commit()
+            assert await (await reopened.execute("SELECT * FROM chunks_fts")).fetchall() == []
+            assert (
+                await (await reopened.execute("SELECT * FROM memweave_fts_lookup")).fetchall() == []
+            )
+
+    async def test_fts_metadata_lookups_use_btree_indexes(self, db):
+        for column in ("id", "path"):
+            rows = await (
+                await db.execute(
+                    f"EXPLAIN QUERY PLAN SELECT fts_rowid FROM memweave_fts_lookup WHERE {column} = ?",
+                    ["needle"],
+                )
+            ).fetchall()
+            assert any("USING COVERING INDEX" in row[3] for row in rows)
+
     @pytest.mark.asyncio
     async def test_upsert_and_search_fts(self, store, db):
         await store.upsert_fts(

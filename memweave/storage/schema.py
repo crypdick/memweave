@@ -32,7 +32,7 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # ── Table creation SQL ──────────────────────────────────────────────────────
 
@@ -153,7 +153,7 @@ async def ensure_schema(db: aiosqlite.Connection) -> None:
         async with aiosqlite.connect(":memory:") as db:
             await ensure_schema(db)
             version = await get_schema_version(db)
-            assert version == 1
+            assert version == 2
     """
     async with db.executescript(
         "\n".join(
@@ -169,6 +169,24 @@ async def ensure_schema(db: aiosqlite.Connection) -> None:
     ):
         pass
 
+    if await get_schema_version(db) < 2:
+        # Persistent metadata stays consistent across connections and restarts.
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS memweave_fts_lookup "
+            "(fts_rowid INTEGER PRIMARY KEY, id TEXT, path TEXT)"
+        )
+        await db.execute(
+            "INSERT OR REPLACE INTO memweave_fts_lookup SELECT rowid, id, path FROM chunks_fts"
+        )
+        await db.execute("CREATE INDEX IF NOT EXISTS memweave_fts_id ON memweave_fts_lookup(id)")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS memweave_fts_path ON memweave_fts_lookup(path)"
+        )
+        await db.execute("CREATE TABLE IF NOT EXISTS index_rebuild_files (path TEXT PRIMARY KEY)")
+        await db.execute(
+            "INSERT OR REPLACE INTO meta (key,value) VALUES ('schema_version', ?)",
+            [str(SCHEMA_VERSION)],
+        )
     await _ensure_schema_version(db)
     await db.commit()
     logger.debug("Schema ensured (version %d)", SCHEMA_VERSION)
@@ -205,7 +223,6 @@ async def ensure_vector_table(db: aiosqlite.Connection, dims: int) -> bool:
     sql = _CREATE_CHUNKS_VEC_TEMPLATE.format(dims=dims)
     try:
         await db.execute(sql)
-        await db.commit()
         logger.debug("Vector table ensured (dims=%d)", dims)
         return True
     except Exception as exc:
@@ -223,7 +240,7 @@ async def get_schema_version(db: aiosqlite.Connection) -> int:
         db: Open ``aiosqlite.Connection``.
 
     Returns:
-        Integer schema version (currently ``1``), or ``0`` if not set.
+        Integer schema version (currently ``2``), or ``0`` if not set.
     """
     try:
         cursor = await db.execute("SELECT value FROM meta WHERE key = 'schema_version'")

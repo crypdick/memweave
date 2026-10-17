@@ -467,6 +467,15 @@ class SQLiteStore:
 
     # ── FTS table ────────────────────────────────────────────────────────────
 
+    async def _delete_fts_rows(self, column: str, value: str) -> None:
+        # column is an internal constant (id or path), never caller input.
+        await self._db.execute(
+            "DELETE FROM chunks_fts WHERE rowid IN "
+            f"(SELECT fts_rowid FROM memweave_fts_lookup WHERE {column} = ?)",
+            [value],
+        )
+        await self._db.execute(f"DELETE FROM memweave_fts_lookup WHERE {column} = ?", [value])
+
     async def upsert_fts(
         self,
         text: str,
@@ -501,14 +510,18 @@ class SQLiteStore:
         """
         try:
             # Step 1: Delete existing FTS entry (FTS5 has no native upsert)
-            await self._db.execute("DELETE FROM chunks_fts WHERE id = ?", [chunk_id])
+            await self._delete_fts_rows("id", chunk_id)
             # Step 2: Insert fresh row with latest text
-            await self._db.execute(
+            cursor = await self._db.execute(
                 """
                 INSERT INTO chunks_fts (text, id, path, source, model, start_line, end_line)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 [text, chunk_id, path, source, model, start_line, end_line],
+            )
+            await self._db.execute(
+                "INSERT INTO memweave_fts_lookup VALUES (?, ?, ?)",
+                [cursor.lastrowid, chunk_id, path],
             )
         except Exception as exc:
             raise StorageError(f"Failed to upsert FTS entry id={chunk_id!r}: {exc}") from exc
@@ -527,7 +540,7 @@ class SQLiteStore:
             StorageError: On database write failure.
         """
         try:
-            await self._db.execute("DELETE FROM chunks_fts WHERE path = ?", [path])
+            await self._delete_fts_rows("path", path)
         except Exception as exc:
             raise StorageError(f"Failed to delete FTS entries for path={path!r}: {exc}") from exc
 
