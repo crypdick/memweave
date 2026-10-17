@@ -762,6 +762,18 @@ class MemWeave:
             await self._store.delete_fts_by_path(stale_path)
             await self._store.delete_file(stale_path)
 
+        # Changed/deleted files can leave vectors whose chunk IDs no longer
+        # exist. Reconcile before publishing a complete generation, including
+        # leftovers produced by older library versions.
+        if self._vector_available:
+            table = await (
+                await self._db.execute("SELECT 1 FROM sqlite_master WHERE name = 'chunks_vec'")
+            ).fetchone()
+            if table:
+                await self._db.execute(
+                    "DELETE FROM chunks_vec WHERE id NOT IN (SELECT id FROM chunks)"
+                )
+
         # Update provider fingerprint meta
         await self._save_provider_fingerprint()
         await self._db.execute("DELETE FROM meta WHERE key = ?", [_REBUILD_KEY])

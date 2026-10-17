@@ -137,3 +137,31 @@ async def test_vector_replacement_updates_existing_id_atomically(tmp_path: Path)
             await mem._db.execute("SELECT embedding FROM chunks_vec WHERE id=?", [row[0]])
         ).fetchone()
         assert restored[0] == row[1]
+
+
+async def test_sync_removes_vectors_for_changed_deleted_and_legacy_chunks(tmp_path: Path):
+    path = _write_md(tmp_path, "memory/a.md", "Original document")
+    async with MemWeave(_make_config(tmp_path), embedding_provider=MockEmbeddingProvider()) as mem:
+        await mem.index()
+        await mem._upsert_vec(
+            "legacy-orphan",
+            [0.1]
+            * (
+                len(
+                    (await (await mem._db.execute("SELECT embedding FROM chunks_vec")).fetchone())[
+                        0
+                    ]
+                )
+                // 4
+            ),
+        )
+        await mem._store.commit()
+        path.write_text("Completely changed document")
+        await mem.index()
+        rows = await (await mem._db.execute("SELECT id FROM chunks_vec")).fetchall()
+        chunks = await (await mem._db.execute("SELECT id FROM chunks")).fetchall()
+        assert rows == chunks
+        assert len(rows) == 1
+        path.unlink()
+        await mem.index()
+        assert await (await mem._db.execute("SELECT id FROM chunks_vec")).fetchall() == []
