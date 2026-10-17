@@ -1033,8 +1033,11 @@ class MemWeave:
 
         vec_bytes = struct.pack(f"{len(vec)}f", *vec)
         try:
+            # vec0 does not implement SQLite's OR REPLACE conflict behavior.
+            # Keep replacement inside the caller's atomic file transaction.
+            await self._db.execute("DELETE FROM chunks_vec WHERE id = ?", [chunk_id])
             await self._db.execute(
-                "INSERT OR REPLACE INTO chunks_vec (id, embedding) VALUES (?, ?)",
+                "INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)",
                 [chunk_id, vec_bytes],
             )
         except Exception as exc:

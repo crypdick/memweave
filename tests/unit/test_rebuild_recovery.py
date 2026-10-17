@@ -117,3 +117,23 @@ async def test_large_file_retains_embedding_batches_without_publishing_partial_t
             for text in batch
         )
         assert (await resumed.files())[0].hash != old_hash
+
+
+async def test_vector_replacement_updates_existing_id_atomically(tmp_path: Path):
+    import struct
+
+    _write_md(tmp_path, "memory/a.md", "A document with an existing vector")
+    async with MemWeave(_make_config(tmp_path), embedding_provider=MockEmbeddingProvider()) as mem:
+        await mem.index()
+        row = await (await mem._db.execute("SELECT id, embedding FROM chunks_vec")).fetchone()
+        replacement = [0.25] * (len(row[1]) // 4)
+        await mem._upsert_vec(row[0], replacement)
+        updated = await (
+            await mem._db.execute("SELECT embedding FROM chunks_vec WHERE id=?", [row[0]])
+        ).fetchone()
+        assert list(struct.unpack(f"{len(replacement)}f", updated[0])) == replacement
+        await mem._store.rollback()
+        restored = await (
+            await mem._db.execute("SELECT embedding FROM chunks_vec WHERE id=?", [row[0]])
+        ).fetchone()
+        assert restored[0] == row[1]
